@@ -282,12 +282,22 @@ class DCIDSTrainer:
         self.recognition_net = RecognitionNetwork(input_dim, action_dim, [256, 128, 64, 32], latent_dim).to(device)
         self.main_q_net = MainQNetwork(input_dim, latent_dim, [128, 64, 32], action_dim).to(device)
         
+        # 新增：目标网络
+        self.target_q_net = MainQNetwork(input_dim, latent_dim, [128, 64, 32], action_dim).to(device)
+        self.target_q_net.load_state_dict(self.main_q_net.state_dict())
+        self.target_q_net.eval()
+        
         # 优化器
         self.optimizer = torch.optim.Adam([
             {'params': self.prior_net.parameters()},
             {'params': self.recognition_net.parameters()},
             {'params': self.main_q_net.parameters()}
         ], lr=1e-4)
+        
+        # 新增：目标网络更新参数
+        self.tau = 0.01  # 软更新系数
+        self.update_frequency = 10  # 更新频率
+        self.gamma = 0.99  # 折扣因子
         
         # 训练参数
         self.epsilon = 0.9
@@ -298,6 +308,12 @@ class DCIDSTrainer:
         self.losses = []
         self.accuracies = []
         self.rewards = []
+        self.step_count = 0
+    
+    def _soft_update_target_network(self):
+        """软更新目标网络参数"""
+        for target_param, main_param in zip(self.target_q_net.parameters(), self.main_q_net.parameters()):
+            target_param.data.copy_(self.tau * main_param.data + (1.0 - self.tau) * target_param.data)
     
     def train_episode(self, dataset, batch_size=100):
         """训练一个episode"""
@@ -310,22 +326,21 @@ class DCIDSTrainer:
         correct_predictions = 0
         
         for t in range(batch_size):
-            state = states[t].unsqueeze(0)  # (1, input_dim)
-            action_true = actions_true[t].unsqueeze(0)  # (1,)
+            self.step_count += 1
+            state = states[t].unsqueeze(0)
+            action_true = actions_true[t].unsqueeze(0)
             
             # 前向传播
-            # 1. 先验网络
             mu_prior, log_var_prior = self.prior_net(state)
             
-            # 2. 识别网络（使用真实标签）
             action_one_hot = F.one_hot(action_true, num_classes=self.action_dim).float()
             mu_recog, log_var_recog = self.recognition_net(state, action_one_hot)
             z_recog = reparameterize(mu_recog, log_var_recog)
             
-            # 3. Q网络（使用识别网络的潜在变量）
+            # 主Q网络
             q_values = self.main_q_net(state, z_recog)
             
-            # ε-greedy策略选择动作
+            # ε-greedy策略
             if np.random.random() < self.epsilon:
                 action_pred = torch.randint(0, self.action_dim, (1,)).to(self.device)
             else:
@@ -335,18 +350,26 @@ class DCIDSTrainer:
             reward = 1 if action_pred.item() == action_true.item() else -1
             episode_reward += reward
             
-            # 统计准确率
             if action_pred.item() == action_true.item():
                 correct_predictions += 1
             
-            # 计算损失
+            # 使用目标网络计算目标Q值
+            with torch.no_grad():
+                mu_prior_next, log_var_prior_next = self.prior_net(state)
+                z_prior_next = reparameterize(mu_prior_next, log_var_prior_next)
+                next_q_values = self.target_q_net(state, z_prior_next)
+                max_next_q = torch.max(next_q_values).item()
+            
+            # 目标Q值：y = r + γ * max_a' Q_target(s', a')
+            target_q = reward + self.gamma * max_next_q
+            
+            # Q学习损失
+            current_q = q_values[0, action_pred]
+            q_loss = F.mse_loss(current_q, torch.tensor([target_q], dtype=torch.float32, device=self.device))
+            
             # KL散度损失
             kl_loss = -0.5 * torch.sum(1 + log_var_recog - log_var_prior - 
                                      (log_var_recog.exp() + (mu_recog - mu_prior).pow(2)) / log_var_prior.exp())
-            
-            # Q学习损失
-            target_q = torch.tensor([reward], dtype=torch.float32, device=self.device)
-            q_loss = F.mse_loss(q_values[0, action_pred], target_q)
             
             # 总损失
             total_loss = kl_loss + q_loss
@@ -356,6 +379,10 @@ class DCIDSTrainer:
             self.optimizer.zero_grad()
             total_loss.backward()
             self.optimizer.step()
+            
+            # 定期更新目标网络
+            if self.step_count % self.update_frequency == 0:
+                self._soft_update_target_network()
         
         # 更新epsilon
         self.epsilon = max(self.min_epsilon, self.epsilon * self.decay_rate)
@@ -379,20 +406,21 @@ class DCIDSTrainer:
         
         self.prior_net.eval()
         self.main_q_net.eval()
+        self.target_q_net.eval()
         
         correct = 0
         total = len(y_test)
         
         with torch.no_grad():
-            for i in range(0, total, 100):  # 分批处理避免内存不足
+            for i in range(0, total, 100):
                 batch_states = X_test[i:i+100]
                 batch_labels = y_test[i:i+100]
                 
-                # 只使用先验网络（测试阶段）
                 mu_prior, log_var_prior = self.prior_net(batch_states)
                 z_prior = reparameterize(mu_prior, log_var_prior)
                 
-                q_values = self.main_q_net(batch_states, z_prior)
+                # 使用目标网络进行预测
+                q_values = self.target_q_net(batch_states, z_prior)
                 pred_labels = torch.argmax(q_values, dim=1)
                 
                 correct += (pred_labels == batch_labels).sum().item()
@@ -401,26 +429,35 @@ class DCIDSTrainer:
         
         self.prior_net.train()
         self.main_q_net.train()
+        self.target_q_net.train()
         
         return accuracy
+    
+    def load_model(self, path):
+        """加载模型"""
+        checkpoint = torch.load(path)
+        self.prior_net.load_state_dict(checkpoint['prior_net'])
+        self.recognition_net.load_state_dict(checkpoint['recognition_net'])
+        self.main_q_net.load_state_dict(checkpoint['main_q_net'])
+        self.target_q_net.load_state_dict(checkpoint['target_q_net'])
+        self.epsilon = checkpoint.get('epsilon', 0.1)
+        self.step_count = checkpoint.get('step_count', 0)
+        print(f"模型已加载，步数: {self.step_count}, epsilon: {self.epsilon}")
     
     def plot_training_progress(self):
         """绘制训练过程"""
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4))
         
-        # 损失曲线
         ax1.plot(self.losses)
         ax1.set_title('Training Loss')
         ax1.set_xlabel('Episode')
         ax1.set_ylabel('Loss')
         
-        # 准确率曲线
         ax2.plot(self.accuracies)
         ax2.set_title('Training Accuracy')
         ax2.set_xlabel('Episode')
         ax2.set_ylabel('Accuracy')
         
-        # 奖励曲线
         ax3.plot(self.rewards)
         ax3.set_title('Average Reward')
         ax3.set_xlabel('Episode')
@@ -453,8 +490,8 @@ def main():
     trainer = DCIDSTrainer(input_dim, action_dim)
     
     # 训练参数
-    total_episodes = 300
-    batch_size = 100
+    total_episodes = 500
+    batch_size = 50
     
     print("\n开始训练...")
     print(f"{'Episode':<8} {'Loss':<10} {'Accuracy':<10} {'Reward':<10} {'Epsilon':<10}")
