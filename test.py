@@ -114,32 +114,151 @@ class TONIoTDataset:
         print(f"类别分布: {np.bincount(self.y_train)}")
     
     def load_and_preprocess_data(self, data_path):
-        """加载和预处理真实数据"""
-        # 这里需要根据实际的TON_IoT数据集格式进行调整
-        # 假设数据是CSV格式，最后一列是标签
+        """加载和预处理TON_IoT数据集"""
+        print(f"加载TON_IoT数据集: {data_path}")
+        
+        # 1. 加载数据
         data = pd.read_csv(data_path)
+        print(f"原始数据形状: {data.shape}")
+        print(f"数据列: {list(data.columns)}")
+        print(f"前5行数据:\n{data.head()}")
         
-        # 分离特征和标签
-        self.X = data.iloc[:, :-1].values
-        self.y = data.iloc[:, -1].values
+        # 2. 检查数据类型
+        print("\n数据类型:")
+        for col in data.columns:
+            print(f"{col}: {data[col].dtype}")
         
-        # 编码标签
+        # 3. 确定标签列 - 使用type列作为细粒度分类标签
+        if 'type' in data.columns:
+            labels = data['type'].values
+            print(f"\n使用 'type' 列作为标签")
+        else:
+            raise ValueError("数据集中没有找到 'type' 列")
+        
+        # 4. 提取特征 - 排除标签列（type和label）
+        # 注意：label列是二分类标签，我们不需要它
+        feature_cols = [col for col in data.columns if col not in ['type', 'label']]
+        print(f"特征列: {feature_cols}")
+        
+        # 5. 处理每个特征列
+        processed_features = []
+        
+        for col in feature_cols:
+            col_data = data[col].values
+            
+            # 检查列数据类型
+            if col in ['date', 'time']:
+                # 处理日期和时间列
+                print(f"处理 {col} 列...")
+                
+                if col == 'date':
+                    # 解析日期格式: '25-Apr-19'
+                    try:
+                        # 尝试解析日期
+                        dates = pd.to_datetime(col_data, format='%d-%b-%y')
+                        # 提取日期特征
+                        day = dates.day.values.reshape(-1, 1)
+                        month = dates.month.values.reshape(-1, 1)
+                        year = dates.year.values.reshape(-1, 1)
+                        processed_features.extend([day, month, year])
+                        print(f"  日期列已解析为: 日({day.shape}), 月({month.shape}), 年({year.shape})")
+                    except Exception as e:
+                        print(f"  日期解析失败: {e}")
+                        # 使用标签编码作为备选
+                        le = LabelEncoder()
+                        encoded = le.fit_transform(col_data).reshape(-1, 1)
+                        processed_features.append(encoded)
+                        print(f"  使用标签编码")
+                
+                elif col == 'time':
+                    # 解析时间格式: '8:59:02'
+                    try:
+                        # 分割时间字符串
+                        time_parts = []
+                        for time_str in col_data:
+                            h, m, s = time_str.split(':')
+                            time_parts.append([int(h), int(m), int(float(s))])
+                        
+                        time_array = np.array(time_parts)
+                        hour = time_array[:, 0].reshape(-1, 1)
+                        minute = time_array[:, 1].reshape(-1, 1)
+                        second = time_array[:, 2].reshape(-1, 1)
+                        processed_features.extend([hour, minute, second])
+                        print(f"  时间列已解析为: 时({hour.shape}), 分({minute.shape}), 秒({second.shape})")
+                    except Exception as e:
+                        print(f"  时间解析失败: {e}")
+                        # 使用标签编码作为备选
+                        le = LabelEncoder()
+                        encoded = le.fit_transform(col_data).reshape(-1, 1)
+                        processed_features.append(encoded)
+                        print(f"  使用标签编码")
+            
+            else:
+                # 处理数值列
+                try:
+                    # 尝试转换为float
+                    numeric_data = pd.to_numeric(col_data, errors='coerce').reshape(-1, 1)
+                    
+                    # 检查NaN值
+                    nan_count = np.isnan(numeric_data).sum()
+                    if nan_count > 0:
+                        print(f"  {col} 列有 {nan_count} 个NaN值，用均值填充")
+                        # 用均值填充NaN
+                        col_mean = np.nanmean(numeric_data)
+                        numeric_data = np.where(np.isnan(numeric_data), col_mean, numeric_data)
+                    
+                    processed_features.append(numeric_data)
+                    print(f"  数值列 {col}: 形状 {numeric_data.shape}")
+                    
+                except Exception as e:
+                    # 如果转换失败，使用标签编码
+                    print(f"  {col} 列转换为数值失败: {e}")
+                    le = LabelEncoder()
+                    encoded = le.fit_transform(col_data).reshape(-1, 1)
+                    processed_features.append(encoded)
+                    print(f"  使用标签编码")
+        
+        # 6. 合并所有特征
+        self.X = np.hstack(processed_features)
+        print(f"\n处理后特征维度: {self.X.shape}")
+        
+        # 7. 编码标签
         le = LabelEncoder()
-        self.y = le.fit_transform(self.y)
+        self.y = le.fit_transform(labels)
         
-        # 划分训练测试集
+        # 保存标签映射
+        self.label_mapping = dict(zip(le.classes_, le.transform(le.classes_)))
+        print(f"标签映射: {self.label_mapping}")
+        
+        # 8. 检查标签分布
+        unique_labels, label_counts = np.unique(self.y, return_counts=True)
+        print(f"\n标签分布:")
+        for label_id, count in zip(unique_labels, label_counts):
+            label_name = list(self.label_mapping.keys())[list(self.label_mapping.values()).index(label_id)]
+            print(f"  {label_name} (ID={label_id}): {count} 个样本")
+        
+        # 9. 检查并处理NaN值
+        if np.isnan(self.X).any():
+            print(f"发现 {np.isnan(self.X).sum()} 个NaN值，用0填充")
+            self.X = np.nan_to_num(self.X)
+        
+        # 10. 划分训练测试集
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
             self.X, self.y, test_size=0.2, random_state=42, stratify=self.y
         )
         
-        # 标准化特征
+        # 11. 标准化特征
         self.scaler = StandardScaler()
         self.X_train = self.scaler.fit_transform(self.X_train)
         self.X_test = self.scaler.transform(self.X_test)
         
-        print(f"训练集大小: {self.X_train.shape}")
+        print(f"\n训练集大小: {self.X_train.shape}")
         print(f"测试集大小: {self.X_test.shape}")
-        print(f"类别分布: {np.bincount(self.y_train)}")
+        print(f"训练集类别分布: {np.bincount(self.y_train)}")
+        
+        # 保存特征维度
+        self.input_dim = self.X_train.shape[1]
+        print(f"输入特征维度: {self.input_dim}")
     
     def get_batch(self, batch_size):
         """随机获取一个batch的数据"""
@@ -316,21 +435,28 @@ def main():
     torch.manual_seed(42)
     np.random.seed(42)
     
-    # 参数设置
-    input_dim = 105
-    action_dim = 4  # 假设有4个类别
-    total_episodes = 300
-    batch_size = 100
-    
     print(f"使用设备: {'cuda' if torch.cuda.is_available() else 'cpu'}")
     
-    # 加载数据
-    dataset = TONIoTDataset()  # 不提供路径将创建模拟数据
+    # 加载真实数据
+    dataset = TONIoTDataset(data_path="Train_Test_IoT_Fridge.csv")  # 替换为你的文件路径
+    
+    # 使用数据集计算出的特征维度
+    input_dim = dataset.input_dim
+    
+    # 计算实际类别数量
+    action_dim = len(np.unique(dataset.y))
+    
+    print(f"输入特征维度: {input_dim}")
+    print(f"动作空间（类别数量）: {action_dim}")
     
     # 初始化训练器
     trainer = DCIDSTrainer(input_dim, action_dim)
     
-    print("开始训练...")
+    # 训练参数
+    total_episodes = 300
+    batch_size = 100
+    
+    print("\n开始训练...")
     print(f"{'Episode':<8} {'Loss':<10} {'Accuracy':<10} {'Reward':<10} {'Epsilon':<10}")
     print("-" * 50)
     
