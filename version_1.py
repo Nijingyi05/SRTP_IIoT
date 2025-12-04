@@ -125,7 +125,9 @@ class TONIoTDataset:
         
         # 2. 检查数据类型
         print("\n数据类型:")
+        dtypes = {}
         for col in data.columns:
+            dtypes[col] = data[col].dtype
             print(f"{col}: {data[col].dtype}")
         
         # 3. 确定标签列 - 使用type列作为细粒度分类标签
@@ -138,29 +140,33 @@ class TONIoTDataset:
         # 4. 提取特征 - 排除标签列（type和label）
         # 注意：label列是二分类标签，我们不需要它
         feature_cols = [col for col in data.columns if col not in ['type', 'label']]
-        print(f"特征列: {feature_cols}")
+        print(f"\n特征列: {feature_cols}")
         
         # 5. 处理每个特征列
         processed_features = []
+        feature_info = []  # 记录每个特征的信息
         
         for col in feature_cols:
             col_data = data[col].values
+            print(f"\n处理 '{col}' 列 (数据类型: {dtypes[col]})...")
             
-            # 检查列数据类型
+            # 特殊处理日期和时间列
             if col in ['date', 'time']:
-                # 处理日期和时间列
-                print(f"处理 {col} 列...")
-                
                 if col == 'date':
                     # 解析日期格式: '25-Apr-19'
                     try:
-                        # 尝试解析日期
                         dates = pd.to_datetime(col_data, format='%d-%b-%y')
                         # 提取日期特征
                         day = dates.day.values.reshape(-1, 1)
                         month = dates.month.values.reshape(-1, 1)
                         year = dates.year.values.reshape(-1, 1)
+                        
                         processed_features.extend([day, month, year])
+                        feature_info.extend([
+                            {'name': f'{col}_day', 'type': 'numeric'},
+                            {'name': f'{col}_month', 'type': 'numeric'},
+                            {'name': f'{col}_year', 'type': 'numeric'}
+                        ])
                         print(f"  日期列已解析为: 日({day.shape}), 月({month.shape}), 年({year.shape})")
                     except Exception as e:
                         print(f"  日期解析失败: {e}")
@@ -168,6 +174,7 @@ class TONIoTDataset:
                         le = LabelEncoder()
                         encoded = le.fit_transform(col_data).reshape(-1, 1)
                         processed_features.append(encoded)
+                        feature_info.append({'name': col, 'type': 'categorical', 'encoder': le})
                         print(f"  使用标签编码")
                 
                 elif col == 'time':
@@ -176,14 +183,24 @@ class TONIoTDataset:
                         # 分割时间字符串
                         time_parts = []
                         for time_str in col_data:
-                            h, m, s = time_str.split(':')
-                            time_parts.append([int(h), int(m), int(float(s))])
+                            try:
+                                h, m, s = time_str.split(':')
+                                time_parts.append([int(h), int(m), int(float(s))])
+                            except:
+                                # 如果时间格式不标准，使用0填充
+                                time_parts.append([0, 0, 0])
                         
                         time_array = np.array(time_parts)
                         hour = time_array[:, 0].reshape(-1, 1)
                         minute = time_array[:, 1].reshape(-1, 1)
                         second = time_array[:, 2].reshape(-1, 1)
+                        
                         processed_features.extend([hour, minute, second])
+                        feature_info.extend([
+                            {'name': f'{col}_hour', 'type': 'numeric'},
+                            {'name': f'{col}_minute', 'type': 'numeric'},
+                            {'name': f'{col}_second', 'type': 'numeric'}
+                        ])
                         print(f"  时间列已解析为: 时({hour.shape}), 分({minute.shape}), 秒({second.shape})")
                     except Exception as e:
                         print(f"  时间解析失败: {e}")
@@ -191,36 +208,78 @@ class TONIoTDataset:
                         le = LabelEncoder()
                         encoded = le.fit_transform(col_data).reshape(-1, 1)
                         processed_features.append(encoded)
+                        feature_info.append({'name': col, 'type': 'categorical', 'encoder': le})
                         print(f"  使用标签编码")
             
             else:
-                # 处理数值列
-                try:
-                    # 尝试转换为float
-                    numeric_data = pd.to_numeric(col_data, errors='coerce').reshape(-1, 1)
-                    
-                    # 检查NaN值
-                    nan_count = np.isnan(numeric_data).sum()
-                    if nan_count > 0:
-                        print(f"  {col} 列有 {nan_count} 个NaN值，用均值填充")
-                        # 用均值填充NaN
-                        col_mean = np.nanmean(numeric_data)
-                        numeric_data = np.where(np.isnan(numeric_data), col_mean, numeric_data)
-                    
-                    processed_features.append(numeric_data)
-                    print(f"  数值列 {col}: 形状 {numeric_data.shape}")
-                    
-                except Exception as e:
-                    # 如果转换失败，使用标签编码
-                    print(f"  {col} 列转换为数值失败: {e}")
+                # 处理非日期时间列
+                if dtypes[col] == 'object' or dtypes[col] == 'string':
+                    # 分类特征：使用标签编码
                     le = LabelEncoder()
                     encoded = le.fit_transform(col_data).reshape(-1, 1)
                     processed_features.append(encoded)
-                    print(f"  使用标签编码")
+                    feature_info.append({'name': col, 'type': 'categorical', 'encoder': le})
+                    print(f"  分类列，使用标签编码，唯一值: {le.classes_}")
+                    
+                else:
+                    # 数值特征：转换为float，处理NaN
+                    try:
+                        numeric_data = pd.to_numeric(col_data, errors='coerce').reshape(-1, 1)
+                        
+                        # 检查NaN值
+                        nan_count = np.isnan(numeric_data).sum()
+                        if nan_count > 0:
+                            print(f"  有 {nan_count} 个NaN值，用均值填充")
+                            # 用均值填充NaN
+                            col_mean = np.nanmean(numeric_data)
+                            if np.isnan(col_mean):
+                                # 如果所有值都是NaN，用0填充
+                                col_mean = 0
+                                print(f"  所有值都是NaN，用0填充")
+                            numeric_data = np.where(np.isnan(numeric_data), col_mean, numeric_data)
+                        
+                        processed_features.append(numeric_data)
+                        feature_info.append({'name': col, 'type': 'numeric'})
+                        print(f"  数值列，形状 {numeric_data.shape}")
+                        
+                    except Exception as e:
+                        # 如果转换失败，回退到标签编码
+                        print(f"  转换为数值失败: {e}")
+                        le = LabelEncoder()
+                        encoded = le.fit_transform(col_data).reshape(-1, 1)
+                        processed_features.append(encoded)
+                        feature_info.append({'name': col, 'type': 'categorical', 'encoder': le})
+                        print(f"  回退到标签编码")
         
         # 6. 合并所有特征
-        self.X = np.hstack(processed_features)
-        print(f"\n处理后特征维度: {self.X.shape}")
+        if processed_features:
+            self.X = np.hstack(processed_features)
+            print(f"\n处理后特征矩阵形状: {self.X.shape}")
+            
+            # 打印特征信息
+            print(f"\n特征信息:")
+            start_idx = 0
+            for info in feature_info:
+                if 'encoder' in info:
+                    # 分类特征
+                    dim = len(info['encoder'].classes_)
+                    print(f"  {info['name']}: 分类特征 ({dim}个类别)")
+                elif '_' in info['name']:
+                    # 派生特征（如date_day）
+                    dim = 1
+                    print(f"  {info['name']}: 数值特征")
+                else:
+                    # 数值特征
+                    dim = 1
+                    print(f"  {info['name']}: 数值特征")
+                
+                # 打印部分数据
+                if dim == 1:
+                    feature_values = self.X[start_idx:start_idx+1, :5]
+                    print(f"    前5个样本的值: {feature_values.flatten()[:5]}")
+                start_idx += dim
+        else:
+            raise ValueError("没有成功提取任何特征")
         
         # 7. 编码标签
         le = LabelEncoder()
@@ -228,18 +287,19 @@ class TONIoTDataset:
         
         # 保存标签映射
         self.label_mapping = dict(zip(le.classes_, le.transform(le.classes_)))
-        print(f"标签映射: {self.label_mapping}")
+        print(f"\n标签映射: {self.label_mapping}")
         
         # 8. 检查标签分布
         unique_labels, label_counts = np.unique(self.y, return_counts=True)
         print(f"\n标签分布:")
         for label_id, count in zip(unique_labels, label_counts):
             label_name = list(self.label_mapping.keys())[list(self.label_mapping.values()).index(label_id)]
-            print(f"  {label_name} (ID={label_id}): {count} 个样本")
+            print(f"  {label_name} (ID={label_id}): {count} 个样本 ({count/len(self.y)*100:.1f}%)")
         
         # 9. 检查并处理NaN值
         if np.isnan(self.X).any():
-            print(f"发现 {np.isnan(self.X).sum()} 个NaN值，用0填充")
+            nan_count = np.isnan(self.X).sum()
+            print(f"\n发现 {nan_count} 个NaN值，用0填充")
             self.X = np.nan_to_num(self.X)
         
         # 10. 划分训练测试集
@@ -247,7 +307,7 @@ class TONIoTDataset:
             self.X, self.y, test_size=0.2, random_state=42, stratify=self.y
         )
         
-        # 11. 标准化特征
+        # 11. 标准化特征（仅对数值特征）
         self.scaler = StandardScaler()
         self.X_train = self.scaler.fit_transform(self.X_train)
         self.X_test = self.scaler.transform(self.X_test)
@@ -490,7 +550,7 @@ def main():
     trainer = DCIDSTrainer(input_dim, action_dim)
     
     # 训练参数
-    total_episodes = 500
+    total_episodes = 300
     batch_size = 50
     
     print("\n开始训练...")
